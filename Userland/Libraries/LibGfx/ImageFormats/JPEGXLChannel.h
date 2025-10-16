@@ -37,6 +37,9 @@ struct ChannelInfo {
     i8 vshift {};
 };
 
+namespace Detail {
+
+template<OneOf<i32, f32> T>
 class Channel {
     AK_MAKE_NONCOPYABLE(Channel);
     AK_MAKE_DEFAULT_MOVABLE(Channel);
@@ -82,19 +85,44 @@ public:
         return other;
     }
 
-    i32 get(u32 x, u32 y) const
+    template<OneOf<i32, f32> OtherT>
+    requires(!SameAs<T, OtherT>)
+    ErrorOr<Channel<OtherT>> as(u8 bits_per_sample) const
+    {
+        Channel<OtherT> other {};
+
+        other.m_width = m_width;
+        other.m_height = m_height;
+        other.m_hshift = m_hshift;
+        other.m_vshift = m_vshift;
+        other.m_decoded = m_decoded;
+
+        TRY(other.m_pixels.try_resize(other.m_width * other.m_height));
+        for (u32 y {}; y < m_height; ++y) {
+            for (u32 x {}; x < m_width; ++x) {
+                if constexpr (IsSame<OtherT, f32>)
+                    other.set(x, y, static_cast<f32>(get(x, y)) / ((1 << bits_per_sample) - 1));
+                else
+                    other.set(x, y, round(get(x, y) * ((1 << bits_per_sample) - 1)));
+            }
+        }
+
+        return other;
+    }
+
+    T get(u32 x, u32 y) const
     {
         return m_pixels[y * m_width + x];
     }
 
-    i32 get_mirrored(i64 x, i64 y) const
+    T get_mirrored(i64 x, i64 y) const
     {
         x = mirror_1d(x, width());
         y = mirror_1d(y, height());
         return m_pixels[y * m_width + x];
     }
 
-    void set(u32 x, u32 y, i32 value)
+    void set(u32 x, u32 y, T value)
     {
         m_pixels[y * m_width + x] = value;
     }
@@ -147,6 +175,9 @@ public:
     }
 
 private:
+    template<OneOf<i32, f32>>
+    friend class Channel;
+
     Channel() = default;
 
     u32 m_width {};
@@ -157,7 +188,12 @@ private:
 
     bool m_decoded { false };
 
-    Vector<i32> m_pixels {};
+    Vector<T> m_pixels {};
 };
+
+}
+
+using Channel = Detail::Channel<i32>;
+using FloatChannel = Detail::Channel<f32>;
 
 }

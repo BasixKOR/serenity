@@ -2771,7 +2771,7 @@ static FloatMatrix3x3 construct_gabor_like_filter(GaborWeights weights)
     return filter / filter.element_sum();
 }
 
-static FloatMatrix3x3 extract_matrix_from_channel(Channel const& channel, u32 x, u32 y)
+static FloatMatrix3x3 extract_matrix_from_channel(FloatChannel const& channel, u32 x, u32 y)
 {
     FloatMatrix3x3 m;
     auto x_minus_1 = x == 0 ? mirror_1d(x, channel.width()) : x - 1;
@@ -2793,18 +2793,14 @@ static FloatMatrix3x3 extract_matrix_from_channel(Channel const& channel, u32 x,
     return m;
 }
 
-static ErrorOr<void> apply_gabor_like_on_channel(Channel& channel, GaborWeights weights, u8 bits_per_sample)
+static ErrorOr<void> apply_gabor_like_on_channel(FloatChannel& channel, GaborWeights weights)
 {
     auto filter = construct_gabor_like_filter(weights);
     auto out = TRY(channel.copy());
-    // FIXME: Use f32 channels for the whole rendering pipeline!
-    f32 float_convert = (1 << bits_per_sample) - 1;
     for (u32 y = 0; y < channel.height(); ++y) {
         for (u32 x = 0; x < channel.width(); ++x) {
             auto source = extract_matrix_from_channel(channel, x, y);
-            source = source / float_convert;
             auto result = source.hadamard_product(filter).element_sum();
-            result = result * float_convert;
             out.set(x, y, result);
         }
     }
@@ -2812,36 +2808,207 @@ static ErrorOr<void> apply_gabor_like_on_channel(Channel& channel, GaborWeights 
     return {};
 }
 
-static ErrorOr<void> apply_gabor_like_filter(Frame& frame, u8 bits_per_sample)
+static ErrorOr<void> apply_gabor_like_filter(RestorationFilter const& restoration_filter, Span<FloatChannel> channels)
 {
-    auto const& restoration_filter = frame.frame_header.restoration_filter;
+    VERIFY(channels.size() == 3);
+
     Array<GaborWeights, 3> weights {
         GaborWeights { restoration_filter.gab_x_weight1, restoration_filter.gab_x_weight2 },
         GaborWeights { restoration_filter.gab_y_weight1, restoration_filter.gab_y_weight2 },
         GaborWeights { restoration_filter.gab_b_weight1, restoration_filter.gab_b_weight2 },
     };
-    for (auto [i, channel] : enumerate(frame.image->channels())) {
-        TRY(apply_gabor_like_on_channel(channel, weights[i], bits_per_sample));
-        if (i > 2)
-            break;
-    }
+    for (auto [i, channel] : enumerate(channels))
+        TRY(apply_gabor_like_on_channel(channel, weights[i]));
     return {};
 }
 
-// J.1  General
-static ErrorOr<void> apply_restoration_filters(Frame& frame, u8 bits_per_sample)
+// J.4 - Edge-preserving filter
+
+// J.4.2 - Distances
+static f32 DistanceStep0and1(RestorationFilter const& rf, Span<FloatChannel const> input, u32 x, u32 y, i8 cx, i8 cy)
 {
-    auto const& frame_header = frame.frame_header;
-    if constexpr (JPEGXL_DEBUG) {
-        dbgln("Restoration filters:");
-        dbgln(" * Gab: {}", frame_header.restoration_filter.gab);
-        dbgln(" * EPF: {}", frame_header.restoration_filter.epf_iters);
+    f32 dist = 0;
+    auto coords = to_array<IntPoint>({ { 0, 0 }, { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } });
+    for (u8 c = 0; c < 3; c++) {
+        for (auto coord : coords) {
+            auto ix = coord.x();
+            auto iy = coord.y();
+            dist += abs(input[c].get_mirrored(x + ix, y + iy) - input[c].get_mirrored(x + cx + ix, y + cy + iy)) * rf.epf_channel_scale[c];
+        }
+    }
+    return dist;
+}
+
+static f32 DistanceStep2(RestorationFilter const& rf, Span<FloatChannel const> input, u32 x, u32 y, i8 cx, i8 cy)
+{
+    f32 dist = 0;
+    for (u8 c = 0; c < 3; c++) {
+        dist += abs(input[c].get_mirrored(x, y) - input[c].get_mirrored(x + cx, y + cy)) * rf.epf_channel_scale[c];
+    }
+    return dist;
+}
+
+// J.4.3 - Weights
+static f32 Weight(RestorationFilter const& rf, f32 step, f32 distance, f32 sigma, u32 x, u32 y)
+{
+    // "step = /* 0 if first step, 1 if second step, 2 if third step */;"
+    Array<f32, 3> step_multiplier = { 1.65f * rf.epf_pass0_sigma_scale, 1.65f * 1, 1.65f * rf.epf_pass2_sigma_scale };
+    f32 position_multiplier {};
+    // "either coordinate of the reference sample is 0 or 7 UMod 8."
+    if (x % 8 == 0 || x % 8 == 7 || y % 8 == 0 || y % 8 == 7)
+        position_multiplier = rf.epf_border_sad_mul;
+    else
+        position_multiplier = 1;
+    f32 inv_sigma = step_multiplier[step] * 4 * (1 - sqrt(0.5f)) / sigma;
+    f32 scaled_distance = position_multiplier * distance;
+    f32 v = 1 - scaled_distance * inv_sigma;
+    if (v <= 0)
+        return 0;
+    return v;
+}
+
+// J.4.4 - Weighted average
+static void apply_epf_step_on_pixel(RestorationFilter const& rf, Span<FloatChannel const> input, Span<FloatChannel> output, u32 step, f32 sigma, u32 x, u32 y)
+{
+    auto kernel_coords = [&]() {
+        if (step == 0) {
+            static constexpr Array points = to_array<IntPoint>({ { 0, 0 }, { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 },
+                { 1, -1 }, { 1, 1 }, { -1, 1 }, { -1, -1 }, { -2, 0 },
+                { 2, 0 }, { 0, 2 }, { 0, -2 } });
+            return points.span();
+        }
+        static constexpr Array points = to_array<IntPoint>({ { 0, 0 }, { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } });
+        return points.span();
+    }();
+
+    f32 sum_weights = 0;
+    Array<f32, 3> sum_channels = { 0, 0, 0 };
+    for (auto coord : kernel_coords) {
+        auto ix = coord.x();
+        auto iy = coord.y();
+        f32 distance {};
+        if (step == 0 || step == 1) {
+            distance = DistanceStep0and1(rf, input, x, y, ix, iy);
+        } else {
+            distance = DistanceStep2(rf, input, x, y, ix, iy);
+        }
+        f32 weight = Weight(rf, step, distance, sigma, x, y);
+        sum_weights += weight;
+        for (u8 c = 0; c < 3; c++) {
+            sum_channels[c] += input[c].get_mirrored(x + ix, y + iy) * weight;
+        }
+    }
+    for (u8 c = 0; c < 3; c++) {
+        output[c].set(x, y, sum_channels[c] / sum_weights);
+    }
+}
+
+// J.4.1 - General
+static void apply_epf_step(RestorationFilter const& rf, Span<FloatChannel const> input, Span<FloatChannel> output, u32 step, f32 sigma)
+{
+    for (u64 y = 0; y < input[0].height(); ++y) {
+        for (u64 x = 0; x < input[0].width(); ++x)
+            apply_epf_step_on_pixel(rf, input, output, step, sigma, x, y);
+    }
+}
+
+static ErrorOr<void> apply_epf_filter(FrameHeader const& frame_header, Span<FloatChannel> channels)
+{
+    // "sigma is then computed as specified by the following code if the frame encoding is kVarDCT, else it is set to rf.epf_sigma_for_modular."
+    if (frame_header.encoding == Encoding::kVarDCT)
+        return Error::from_string_literal("FIXME: Compute epf's sigma for VarDCT frames.");
+    f32 sigma = frame_header.restoration_filter.epf_sigma_for_modular;
+
+    // "The output of each step is used as an input for the following step."
+    Vector<FloatChannel> next_input;
+    for (u8 i = 0; i < channels.size(); ++i)
+        TRY(next_input.try_append(TRY(channels[i].copy())));
+
+    // "The first step is only done if rf.epf_iters == 3."
+    if (frame_header.restoration_filter.epf_iters == 3) {
+        apply_epf_step(frame_header.restoration_filter, next_input, channels, 0, sigma);
+        next_input.clear();
+        for (u8 i = 0; i < channels.size(); ++i)
+            TRY(next_input.try_append(TRY(channels[i].copy())));
     }
 
-    if (frame_header.restoration_filter.gab)
-        TRY(apply_gabor_like_filter(frame, bits_per_sample));
-    if (frame_header.restoration_filter.epf_iters != 0)
-        dbgln("JPEGXLLoader: FIXME: Apply edge preserving filters");
+    // "The second step is always done (if rf.epf_iters > 0)."
+    if (frame_header.restoration_filter.epf_iters > 0) {
+        apply_epf_step(frame_header.restoration_filter, next_input, channels, 1, sigma);
+        next_input.clear();
+        for (u8 i = 0; i < channels.size(); ++i)
+            TRY(next_input.try_append(TRY(channels[i].copy())));
+    }
+
+    // "The third step is only done if rf.epf_iters >= 2."
+    if (frame_header.restoration_filter.epf_iters >= 2)
+        apply_epf_step(frame_header.restoration_filter, next_input, channels, 2, sigma);
+
+    return {};
+}
+
+struct SplitChannels {
+    Vector<FloatChannel> color_channels {};
+    Vector<Channel> extra_channels {};
+};
+
+template<typename T2, typename T1>
+static ErrorOr<Vector<Detail::Channel<T2>>> convert_channels(Span<Detail::Channel<T1>> const& channels, u8 bits_per_sample)
+{
+    Vector<Detail::Channel<T2>> new_channels;
+    TRY(new_channels.try_ensure_capacity(channels.size()));
+    for (u32 i = 0; i < channels.size(); ++i)
+        new_channels.append(TRY(channels[i].template as<T2>(bits_per_sample)));
+    return new_channels;
+}
+
+static ErrorOr<SplitChannels> extract_color_channels(ImageMetadata const& metadata, Image& image)
+{
+    auto all_channels = move(image.channels());
+    auto f32_color_channels = TRY(convert_channels<f32>(all_channels.span().trim(metadata.number_of_color_channels()), metadata.bit_depth.bits_per_sample));
+    all_channels.remove(0, metadata.number_of_color_channels());
+    return SplitChannels { move(f32_color_channels), move(all_channels) };
+}
+
+static ErrorOr<void> ensure_enough_color_channels(Vector<FloatChannel>& channels)
+{
+    if (channels.size() == 3)
+        return {};
+    VERIFY(channels.size() == 1);
+    TRY(channels.try_append(TRY(channels[0].copy())));
+    TRY(channels.try_append(TRY(channels[0].copy())));
+    return {};
+}
+
+// J.1 - General
+static ErrorOr<void> apply_restoration_filters(Frame& frame, ImageMetadata const& metadata)
+{
+    auto const& frame_header = frame.frame_header;
+
+    if (frame_header.restoration_filter.gab || frame_header.restoration_filter.epf_iters != 0) {
+        if constexpr (JPEGXL_DEBUG) {
+            dbgln("Restoration filters:");
+            dbgln(" * Gab: {}", frame_header.restoration_filter.gab);
+            dbgln(" * EPF: {}", frame_header.restoration_filter.epf_iters);
+        }
+
+        // FIXME: Clarify where we should actually do the i32 -> f32 convertion.
+        auto channels = TRY(extract_color_channels(metadata, *frame.image));
+        TRY(ensure_enough_color_channels(channels.color_channels));
+
+        if (frame_header.restoration_filter.gab)
+            TRY(apply_gabor_like_filter(frame.frame_header.restoration_filter, channels.color_channels));
+        if (frame_header.restoration_filter.epf_iters != 0)
+            TRY(apply_epf_filter(frame_header, channels.color_channels));
+
+        // Remove unwanted color channels if the image is greyscale.
+        if (metadata.number_of_color_channels() == 1)
+            channels.color_channels.remove(1, 2);
+        auto i32_channels = TRY(convert_channels<i32>(channels.color_channels.span(), metadata.bit_depth.bits_per_sample));
+        TRY(i32_channels.try_extend(move(channels.extra_channels)));
+        frame.image = TRY(Image::adopt_channels(move(i32_channels)));
+    }
+
     return {};
 }
 ///
@@ -3043,7 +3210,7 @@ public:
         auto frame = TRY(read_frame(m_stream, m_header, m_metadata));
         auto const& frame_header = frame.frame_header;
 
-        TRY(apply_restoration_filters(frame, m_metadata.bit_depth.bits_per_sample));
+        TRY(apply_restoration_filters(frame, m_metadata));
 
         TRY(apply_image_features(m_frames, frame, m_metadata));
 
